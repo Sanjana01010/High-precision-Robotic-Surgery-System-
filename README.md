@@ -23,3 +23,14 @@ Servo control using PCA9685 over I2C
 Watchdog monitoring
 Safety and limit enforcement
 Real-time robotic actuation
+
+Technologies Used
+QNX Neutrino RTOS
+C Programming
+POSIX Threads
+TCP/IP Networking
+SPI Communication
+I2C Communication
+GPIO Interface
+Raspberry Pi
+PCA9685 Servo Driver
