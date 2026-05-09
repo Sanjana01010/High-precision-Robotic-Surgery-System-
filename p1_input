@@ -1,0 +1,305 @@
+/* ================================================================ */
+/* QNX  —  Pi1  PROCESS 1 :  INPUT & CONTROL                       */
+/* Raspberry Pi 1 — Doctor Side                                     */
+/*                                                                  */
+/* Threads:                                                         */
+/*   SPI Thread    (PRIO 70) — reads MCP3208 ADC (X, Y, Z, button) */
+/*   Control Thread(PRIO 60) — deadzone/scaling → servo targets     */
+/*                                                                  */
+/* IPC output:                                                      */
+/*   POSIX Message Queue  /mq/control_packets                       */
+/*   Publishes ControlMqMsg at ~100 Hz for Process 2 to forward.    */
+/* ================================================================ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <math.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <devctl.h>
+#include <hw/io-spi.h>
+#include <sys/neutrino.h>
+
+/* ================================================================ */
+/* CONFIG                                                           */
+/* ================================================================ */
+#define SPI_DEVICE          "/dev/io-spi/spi0/dev0"
+
+/* POSIX MQ published to Process 2 */
+#define MQ_CONTROL_PACKETS  "/mq/control_packets"
+#define MQ_MAXMSG           8       /* depth — keeps latency low   */
+
+#define SPI_THREAD_PRIO     70
+#define CONTROL_THREAD_PRIO 60
+
+#define SPI_INTERVAL_NS     1000000ULL    /* 1 ms  — 1 kHz ADC poll  */
+#define CONTROL_INTERVAL_NS 10000000ULL  /* 10 ms — 100 Hz control  */
+
+#define X_CENTER    1750
+#define Y_CENTER    1750
+#define Z_CENTER    1850
+#define DEADZONE    100
+#define SPEED_SCALE 0.0005f
+
+/* ================================================================ */
+/* IPC MESSAGE  (shared with Process 2 — must match exactly)        */
+/* ================================================================ */
+typedef struct __attribute__((packed))
+{
+    uint32_t sequence;
+    uint32_t padding;
+    uint64_t timestamp_ns;
+    float    servo1_deg;
+    float    servo2_deg;
+    float    servo4_deg;
+    uint8_t  gripper;
+    uint8_t  _pad[3];
+} ControlMqMsg;
+
+/* ================================================================ */
+/* SHARED STATE  (between SPI thread and Control thread)            */
+/* ================================================================ */
+static _Atomic int     joy_x          = X_CENTER;
+static _Atomic int     joy_y          = Y_CENTER;
+static _Atomic int     joy_z          = Z_CENTER;
+static _Atomic int     button_pressed = 0;
+
+static _Atomic float   servo1_deg     = 90.0f;
+static _Atomic float   servo2_deg     = 90.0f;
+static _Atomic float   servo4_deg     = 90.0f;
+static _Atomic uint8_t gripper_state  = 0;
+static _Atomic uint32_t seq_counter   = 0;
+
+/* MQ handle — written once in main, read by control_thread */
+static mqd_t mq_out = (mqd_t)-1;
+
+/* ================================================================ */
+/* HELPERS                                                          */
+/* ================================================================ */
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + ts.tv_nsec;
+}
+
+static void set_fifo_priority(int prio)
+{
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = prio;
+    sched_setscheduler(0, SCHED_FIFO, &sp);
+}
+
+static float clampf(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* ================================================================ */
+/* SPI / MCP3208                                                    */
+/* ================================================================ */
+static int configure_spi(int fd)
+{
+    spi_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode       = 0;
+    cfg.clock_rate = 5000000;
+    if (devctl(fd, DCMD_SPI_SET_CONFIG, &cfg, sizeof(cfg), NULL) != EOK)
+    {
+        perror("SPI CONFIG");
+        return -1;
+    }
+    return 0;
+}
+
+static int read_mcp3208(int fd, int channel)
+{
+    uint8_t tx[3];
+    tx[0] = 0x06 | ((channel & 0x04) >> 2);
+    tx[1] = (channel & 0x03) << 6;
+    tx[2] = 0;
+
+    struct { spi_xchng_t hdr; uint8_t data[3]; } msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.nbytes = 3;
+    memcpy(msg.data, tx, 3);
+
+    if (devctl(fd, DCMD_SPI_DATA_XCHNG, &msg, sizeof(msg), NULL) != EOK)
+        return -1;
+
+    return ((msg.data[1] & 0x0F) << 8) | msg.data[2];
+}
+
+static int read_button(void)
+{
+    FILE *fp = popen("gpio-bcm2711 get 17", "r");
+    if (!fp) return 0;
+    char buf[128];
+    memset(buf, 0, sizeof(buf));
+    fgets(buf, sizeof(buf), fp);
+    pclose(fp);
+    return strstr(buf, "level=0") ? 1 : 0;
+}
+
+/* ================================================================ */
+/* SPI THREAD  (PRIO 70)                                            */
+/* Reads joystick axes and button at 1 kHz into shared atomics.     */
+/* ================================================================ */
+static void *spi_thread(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    set_fifo_priority(SPI_THREAD_PRIO);
+
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+
+    while (1)
+    {
+        atomic_store(&joy_x,          read_mcp3208(fd, 0));
+        atomic_store(&joy_y,          read_mcp3208(fd, 1));
+        atomic_store(&joy_z,          read_mcp3208(fd, 2));
+        atomic_store(&button_pressed, read_button());
+
+        next.tv_nsec += SPI_INTERVAL_NS;
+        if (next.tv_nsec >= 1000000000LL) {
+            next.tv_sec++;
+            next.tv_nsec -= 1000000000LL;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    }
+    return NULL;
+}
+
+/* ================================================================ */
+/* CONTROL THREAD  (PRIO 60)                                        */
+/* Applies deadzone + scaling, updates servo targets, publishes     */
+/* ControlMqMsg to /mq/control_packets at 100 Hz.                   */
+/* ================================================================ */
+static void *control_thread(void *arg)
+{
+    (void)arg;
+    set_fifo_priority(CONTROL_THREAD_PRIO);
+
+    int prev_button = 0;
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+
+    while (1)
+    {
+        /* ── Deadzone + rate scaling ── */
+        int dx = atomic_load(&joy_x) - X_CENTER;
+        int dy = atomic_load(&joy_y) - Y_CENTER;
+        int dz = atomic_load(&joy_z) - Z_CENTER;
+
+        if (abs(dx) < DEADZONE) dx = 0;
+        if (abs(dy) < DEADZONE) dy = 0;
+        if (abs(dz) < DEADZONE) dz = 0;
+
+        atomic_store(&servo1_deg,
+            clampf(atomic_load(&servo1_deg) + dy * SPEED_SCALE, 0.0f, 180.0f));
+        atomic_store(&servo2_deg,
+            clampf(atomic_load(&servo2_deg) + dx * SPEED_SCALE, 0.0f, 180.0f));
+        atomic_store(&servo4_deg,
+            clampf(atomic_load(&servo4_deg) + dz * SPEED_SCALE, 0.0f, 180.0f));
+
+        /* ── Button edge → toggle gripper ── */
+        int cur_button = atomic_load(&button_pressed);
+        if (cur_button && !prev_button) {
+            uint8_t g = atomic_load(&gripper_state);
+            atomic_store(&gripper_state, g ? 0 : 1);
+        }
+        prev_button = cur_button;
+
+        /* ── Publish to /mq/control_packets ── */
+        ControlMqMsg msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.sequence     = atomic_fetch_add(&seq_counter, 1);
+        msg.timestamp_ns = now_ns();
+        msg.servo1_deg   = atomic_load(&servo1_deg);
+        msg.servo2_deg   = atomic_load(&servo2_deg);
+        msg.servo4_deg   = atomic_load(&servo4_deg);
+        msg.gripper      = atomic_load(&gripper_state);
+
+        /*
+         * Non-blocking send: if queue is full (Process 2 lagging)
+         * drop the oldest packet — real-time control prefers the
+         * newest position over queue back-pressure.
+         */
+        if (mq_send(mq_out, (const char *)&msg, sizeof(msg), 0) == -1)
+        {
+            if (errno != EAGAIN)
+                perror("[P1] mq_send");
+        }
+
+        /* ── 100 Hz tick ── */
+        next.tv_nsec += CONTROL_INTERVAL_NS;
+        if (next.tv_nsec >= 1000000000LL) {
+            next.tv_sec++;
+            next.tv_nsec -= 1000000000LL;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    }
+    return NULL;
+}
+
+/* ================================================================ */
+/* MAIN                                                             */
+/* ================================================================ */
+int main(void)
+{
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+    ThreadCtl(_NTO_TCTL_IO, NULL);
+
+    /* Button GPIO — pull-up input */
+    system("gpio-bcm2711 set 17 ip pu");
+
+    /* ── Open SPI ── */
+    int spi_fd = open(SPI_DEVICE, O_RDWR);
+    if (spi_fd < 0) { perror("SPI OPEN"); return 1; }
+    if (configure_spi(spi_fd) != 0) return 1;
+
+    /* ── Create / open POSIX MQ (output to Process 2) ── */
+    struct mq_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.mq_flags   = O_NONBLOCK;
+    attr.mq_maxmsg  = MQ_MAXMSG;
+    attr.mq_msgsize = sizeof(ControlMqMsg);
+
+    mq_out = mq_open(MQ_CONTROL_PACKETS,
+                     O_CREAT | O_WRONLY | O_NONBLOCK,
+                     0660, &attr);
+    if (mq_out == (mqd_t)-1) { perror("mq_open control_packets"); return 1; }
+
+    printf("PI1-P1 INPUT & CONTROL STARTING\n");
+    printf("Publishing to %s at 100 Hz\n", MQ_CONTROL_PACKETS);
+
+    pthread_t spi_t, control_t;
+    pthread_create(&spi_t,     NULL, spi_thread,     (void *)(intptr_t)spi_fd);
+    pthread_create(&control_t, NULL, control_thread, NULL);
+
+    /* Status loop */
+    while (1)
+    {
+        printf("[P1] S1=%.2f  S2=%.2f  S4=%.2f  GRIP=%d  SEQ=%u\n",
+               (double)atomic_load(&servo1_deg),
+               (double)atomic_load(&servo2_deg),
+               (double)atomic_load(&servo4_deg),
+               (int)   atomic_load(&gripper_state),
+               (unsigned)atomic_load(&seq_counter));
+        usleep(500000);   /* 2 Hz status print */
+    }
+
+    return 0;
+}
